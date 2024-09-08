@@ -4,6 +4,9 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
+const { promisify } = require('util');
+
+const unlinkAsync = promisify(fs.unlink);
 
 const app = express();
 const port = 3000;
@@ -37,14 +40,22 @@ const processQueue = async () => {
   const { req, res } = queue.shift();
   const { html, css, body_width, body_height } = req.body;
 
+  if (!html) {
+    res.status(400).json({ message: 'HTML content is required' });
+    isProcessing = false;
+    processQueue();
+    return;
+  }
+
   const outputFileName = `image-${uuidv4()}.png`;
+  const outputFilePath = path.join(__dirname, outputFileName);
 
   try {
     // Wrap the content in full HTML structure
     const wrappedHtml = wrapHtmlContent(html, css);
 
     await nodeHtmlToImage({
-      output: `./${outputFileName}`,
+      output: outputFilePath,
       html: wrappedHtml,
       puppeteerArgs: {
         defaultViewport: {
@@ -54,16 +65,21 @@ const processQueue = async () => {
       },
     });
 
-    const filePath = path.join(__dirname, outputFileName);
-    const fileStream = fs.createReadStream(filePath);
+    const fileStream = fs.createReadStream(outputFilePath);
     fileStream.on('open', () => {
       res.setHeader('Content-Type', 'image/png');
       fileStream.pipe(res);
     });
 
-    fileStream.on('error', (err) => {
+    fileStream.on('error', async (err) => {
       res.status(500).send('Error sending image');
+      await unlinkAsync(outputFilePath); // Ensure the file is removed on error
     });
+
+    fileStream.on('close', async () => {
+      await unlinkAsync(outputFilePath); // Clean up the file after sending
+    });
+
   } catch (error) {
     res.status(500).json({ message: 'Error generating image', error: error.message });
   }
