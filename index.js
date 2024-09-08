@@ -1,99 +1,124 @@
 const express = require('express');
 const nodeHtmlToImage = require('node-html-to-image');
-const fs = require('fs');
+const fs = require('fs/promises');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
-const { promisify } = require('util');
-
-const unlinkAsync = promisify(fs.unlink);
+const axios = require('axios');
+const FormData = require('form-data');
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
-// Middleware to parse JSON request body and enable CORS for frontend requests
 app.use(express.json());
 app.use(cors());
 
-// Serve static files
-app.use(express.static(path.join(__dirname, 'public')));
-
-let queue = [];
-let isProcessing = false;
-
-// Function to wrap HTML and CSS content
 const wrapHtmlContent = (html, css) => `
 <html>
 <head><style>${css || ''}</style></head>
-<body>
-  ${html}
-</body>
-</html>
-`;
+<body>${html}</body>
+</html>`;
 
-// Process the queue
+const imagesFolderPath = path.join(__dirname, 'images');
+
+const createImagesFolder = async () => {
+  try {
+    await fs.mkdir(imagesFolderPath, { recursive: true });
+  } catch (err) {
+    console.error('Failed to create images folder:', err);
+  }
+};
+
 const processQueue = async () => {
   if (queue.length === 0 || isProcessing) return;
 
   isProcessing = true;
-
   const { req, res } = queue.shift();
-  const { html, css, body_width, body_height } = req.body;
-
-  if (!html) {
-    res.status(400).json({ message: 'HTML content is required' });
-    isProcessing = false;
-    processQueue();
-    return;
-  }
-
-  const outputFileName = `image-${uuidv4()}.png`;
-  const outputFilePath = path.join(__dirname, outputFileName);
 
   try {
-    // Wrap the content in full HTML structure
-    const wrappedHtml = wrapHtmlContent(html, css);
-
-    await nodeHtmlToImage({
-      output: outputFilePath,
-      html: wrappedHtml,
-      puppeteerArgs: {
-        defaultViewport: {
-          width: body_width || 800,
-          height: body_height || 800,
-        },
-      },
-    });
-
-    const fileStream = fs.createReadStream(outputFilePath);
-    fileStream.on('open', () => {
-      res.setHeader('Content-Type', 'image/png');
-      fileStream.pipe(res);
-    });
-
-    fileStream.on('error', async (err) => {
-      res.status(500).send('Error sending image');
-      await unlinkAsync(outputFilePath); // Ensure the file is removed on error
-    });
-
-    fileStream.on('close', async () => {
-      await unlinkAsync(outputFilePath); // Clean up the file after sending
-    });
-
+    await handleImageGeneration(req, res);
   } catch (error) {
-    res.status(500).json({ message: 'Error generating image', error: error.message });
+    console.error('Error in processQueue:', error);
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 
   isProcessing = false;
   processQueue();
 };
 
-// API to generate image
+const handleImageGeneration = async (req, res) => {
+  const { html, css, body_width = 800, body_height = 800 } = req.body;
+
+  if (!html) {
+    return res.status(400).json({ message: 'HTML content is required' });
+  }
+
+  const outputFileName = `image-${uuidv4()}.png`;
+  const outputFilePath = path.join(imagesFolderPath, outputFileName);
+
+  try {
+    const wrappedHtml = wrapHtmlContent(html, css);
+    await generateImage(wrappedHtml, outputFilePath, body_width, body_height);
+    const imageUrl = await uploadImage(outputFilePath, outputFileName);
+    await fs.unlink(outputFilePath);
+    res.json({ imageUrl });
+  } catch (error) {
+    console.error('Error in handleImageGeneration:', error);
+    res.status(500).json({ message: 'Error generating or uploading image', error: error.message });
+  }
+};
+
+const generateImage = async (html, outputPath, width, height) => {
+  await nodeHtmlToImage({
+    output: outputPath,
+    html,
+    puppeteerArgs: {
+      defaultViewport: { width, height },
+    },
+  });
+};
+
+const uploadImage = async (filePath, fileName) => {
+  const form = new FormData();
+  form.append('file', await fs.readFile(filePath), {
+    filename: fileName,
+    contentType: 'image/png',
+  });
+
+  try {
+    const response = await axios.post('https://screen.viki-web.com/upload.php', form, {
+      headers: {
+        ...form.getHeaders(),
+        'Content-Type': 'multipart/form-data',
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    });
+
+    if (response.data.startsWith('https://')) {
+      return response.data.trim();
+    } else {
+      throw new Error(`Upload failed: ${response.data}`);
+    }
+  } catch (error) {
+    console.error('Error uploading image:', error.message);
+    throw new Error('Failed to upload image to server');
+  }
+};
+
+let queue = [];
+let isProcessing = false;
+
 app.post('/generate-image', (req, res) => {
   queue.push({ req, res });
   processQueue();
 });
 
-app.listen(port, () => {
-  console.log(`Server running at http://localhost:${port}`);
-});
+const startServer = async () => {
+  await createImagesFolder();
+  app.listen(port, () => {
+    console.log(`Server running at http://localhost:${port}`);
+  });
+};
+
+startServer().catch(console.error);
